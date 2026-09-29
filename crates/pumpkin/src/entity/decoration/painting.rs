@@ -264,14 +264,14 @@ impl EntityBase for PaintingEntity {
 
     fn damage_with_context(
         &self,
-        caller: &dyn EntityBase,
+        _caller: &dyn EntityBase,
         _amount: f32,
         _damage_type: DamageType,
         _position: Option<Vector3<f64>>,
-        _source: Option<&dyn EntityBase>,
+        source: Option<&dyn EntityBase>,
         _cause: Option<&dyn EntityBase>,
     ) -> bool {
-        self.drop_and_remove(Some(caller));
+        self.drop_and_remove(source);
         true
     }
 
