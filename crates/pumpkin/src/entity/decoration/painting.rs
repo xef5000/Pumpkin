@@ -3,18 +3,23 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::entity::player::Player;
 use crate::entity::{Entity, EntityBase, living::LivingEntity};
+use crate::net::java::JavaClient;
 use pumpkin_data::BlockDirection;
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
+use pumpkin_data::packet::CURRENT_MC_VERSION;
 use pumpkin_data::painting_variant::PaintingVariant;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::play::Metadata;
+use pumpkin_protocol::java::client::play::{CSetEntityMetadata, Metadata};
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::version::JavaMinecraftVersion;
+
+/// Distance from a block's center to the wall plane a hanging entity sits on.
+const WALL_OFFSET: f64 = 0.46875;
 
 /// The world stores a painting facing as a horizontal value: 0 south, 1 west,
 /// 2 north, 3 east (`Direction.get2DDataValue`). The entity data, and the spawn
@@ -101,9 +106,9 @@ impl PaintingEntity {
         let ccw_step_x = f64::from(face_ccw.to_offset().x);
         let ccw_step_z = f64::from(face_ccw.to_offset().z);
 
-        let mut x = f64::from(target_pos.0.x) + 0.5 - step_x * 0.46875;
+        let mut x = f64::from(target_pos.0.x) + 0.5 - step_x * WALL_OFFSET;
         let mut y = f64::from(target_pos.0.y) + 0.5;
-        let mut z = f64::from(target_pos.0.z) + 0.5 - step_z * 0.46875;
+        let mut z = f64::from(target_pos.0.z) + 0.5 - step_z * WALL_OFFSET;
 
         let width_offset = if width.is_multiple_of(2) { 0.5 } else { 0.0 };
         let height_offset = if height.is_multiple_of(2) { 0.5 } else { 0.0 };
@@ -113,6 +118,27 @@ impl PaintingEntity {
         y += height_offset;
 
         Vector3::new(x, y, z)
+    }
+
+    /// Vanilla `HangingEntity.getPos`: the block in front of the wall that `calculate_center_pos` was built from.
+    /// The client derives it from the spawn position, so the shifted center would move even-sized paintings.
+    #[must_use]
+    pub fn calculate_hanging_pos(
+        center: Vector3<f64>,
+        face: BlockDirection,
+        width: u32,
+        height: u32,
+    ) -> BlockPos {
+        let step = face.to_offset();
+        let ccw = face.rotate_counter_clockwise().to_offset();
+        let width_offset = if width.is_multiple_of(2) { 0.5 } else { 0.0 };
+        let height_offset = if height.is_multiple_of(2) { 0.5 } else { 0.0 };
+
+        BlockPos::floored(
+            center.x + f64::from(step.x) * WALL_OFFSET - width_offset * f64::from(ccw.x),
+            center.y - height_offset,
+            center.z + f64::from(step.z) * WALL_OFFSET - width_offset * f64::from(ccw.z),
+        )
     }
 
     /// Checks if a painting of the specified variant fits on the wall at `location` facing `face`.
@@ -244,6 +270,32 @@ impl EntityBase for PaintingEntity {
         self.sync_variant();
     }
 
+    fn send_java_spawn_packet(&self, client: &JavaClient) {
+        let facing = BlockDirection::from_index(self.entity.data.load(Ordering::Relaxed) as u8)
+            .unwrap_or(BlockDirection::South);
+        let variant = self.variant();
+
+        let mut spawn_packet = self.entity.create_spawn_packet();
+        spawn_packet.position = Self::calculate_hanging_pos(
+            self.entity.pos.load(),
+            facing,
+            variant.width(),
+            variant.height(),
+        )
+        .0
+        .to_f64();
+        if let Ok(data) = client.serialize_packet(&spawn_packet) {
+            client.try_enqueue_packet(data);
+        }
+
+        if let Some(metadata) = self.java_spawn_metadata(CURRENT_MC_VERSION) {
+            let metadata_packet = CSetEntityMetadata::new(self.entity.entity_id.into(), metadata);
+            if let Ok(data) = client.serialize_packet(&metadata_packet) {
+                client.try_enqueue_packet(data);
+            }
+        }
+    }
+
     fn java_spawn_metadata(&self, version: JavaMinecraftVersion) -> Option<Box<[u8]>> {
         let mut metadata = Vec::new();
         Metadata::new(
@@ -355,6 +407,29 @@ mod tests {
         assert_eq!(pos_south.x, 10.5);
         assert_eq!(pos_south.y, 64.5);
         assert!((pos_south.z - 21.03125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hanging_pos_is_the_block_in_front_of_the_wall() {
+        let location = BlockPos(Vector3::new(10, 64, 20));
+        for face in [
+            BlockDirection::North,
+            BlockDirection::South,
+            BlockDirection::West,
+            BlockDirection::East,
+        ] {
+            for width in 1..=4 {
+                for height in 1..=4 {
+                    let center =
+                        PaintingEntity::calculate_center_pos(location, face, width, height);
+                    assert_eq!(
+                        PaintingEntity::calculate_hanging_pos(center, face, width, height),
+                        location.offset(face.to_offset()),
+                        "{face:?} {width}x{height}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
